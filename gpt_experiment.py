@@ -1,7 +1,9 @@
 from datasets import load_dataset
 from openai import OpenAI
+from tqdm import tqdm
+import pandas as pd
 import json, re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 client = OpenAI()
 algo_ds = load_dataset("Kevin355/Who_and_When", "Algorithm-Generated")
@@ -26,7 +28,7 @@ def _extract_json(text: str) -> dict:
         return json.loads(m.group(1))
     a, b = text.find("{"), text.rfind("}")
     if a != -1 and b != -1 and b > a:
-        return json.loads(text[a : b + 1])
+        return json.loads(text[a:b+1])
     raise ValueError("No JSON object found in model output.")
 
 def _normalize_and_validate(d: dict) -> dict:
@@ -71,6 +73,35 @@ def _agent_from_turn(turn: Any) -> str:
                 return k.strip()
     return "Unknown"
 
+def _norm_name(s: Optional[str]) -> Optional[str]:
+    if s is None:
+        return None
+    # normalize both gold and pred the same way (case/space/underscore/punct)
+    return re.sub(r"[\W_]+", "", s).casefold()
+
+def _extract_gold(convo: Dict[str, Any]) -> Tuple[Optional[str], Optional[int]]:
+    # primary keys per dataset card
+    ga = convo.get("mistake_agent")
+    gs = convo.get("mistake_step")
+    # fallbacks just in case
+    if ga is None:
+        for k in ("agent_name", "agent", "who_failed", "failure_agent", "label"):
+            if k in convo and isinstance(convo[k], str) and convo[k].strip():
+                ga = convo[k]; break
+    if gs is None:
+        for k in ("step_number", "step", "when", "failure_step"):
+            if k in convo:
+                gs = convo[k]; break
+    if isinstance(gs, str):
+        m = re.search(r"\d+", gs)
+        gs = int(m.group(0)) if m else None
+    elif gs is not None:
+        try:
+            gs = int(gs)
+        except Exception:
+            gs = None
+    return ga, gs
+
 def call_openai(prompt, model="gpt-4o-mini"):
     system_msg = (
         "You are an expert judge for multi-agent failure attribution. "
@@ -87,11 +118,8 @@ def call_openai(prompt, model="gpt-4o-mini"):
         temperature=0,
     )
     raw = resp.choices[0].message.content
-    try:
-        parsed = _extract_json(raw)
-        return _normalize_and_validate(parsed)
-    except Exception as e:
-        raise RuntimeError(f"Failed to parse/validate model output: {e}\n--- RAW OUTPUT START ---\n{raw}\n--- RAW OUTPUT END ---")
+    parsed = _extract_json(raw)
+    return _normalize_and_validate(parsed)
 
 def all_at_once(category, convo_id):
     convo = category["train"][convo_id]
@@ -118,18 +146,10 @@ def all_at_once(category, convo_id):
 # Step-wise judge that returns the earliest decisive error encountered
 class StepByStepAttributor:
     def __init__(self, client: OpenAI, model: str = "gpt-4o-mini", temperature: float = 0.0, include_ground_truth: bool = False):
-        self.client = client
-        self.model = model
-        self.temperature = temperature
-        self.include_ground_truth = include_ground_truth
-
+        self.client = client; self.model = model; self.temperature = temperature; self.include_ground_truth = include_ground_truth
     def attribute_from_dataset(self, category, convo_id: int) -> Dict[str, Any]:
-        convo = category["train"][convo_id]
-        problem = convo["question"]
-        history = convo["history"]
-        gt = convo.get("answer") or convo.get("final_answer") or convo.get("label") or None
-        return self.attribute(problem=problem, history=history, ground_truth=gt)
-
+        c = category["train"][convo_id]; gt = c.get("answer") or c.get("final_answer") or c.get("label") or None
+        return self.attribute(problem=c["question"], history=c["history"], ground_truth=gt)
     def attribute(self, problem: str, history: List[Any], ground_truth: Optional[str] = None) -> Dict[str, Any]:
         if not isinstance(history, list) or not history:
             return {"agent_name": "Unknown", "step_number": 1, "reason": "Empty or invalid history; unable to run step-by-step attribution."}
@@ -137,25 +157,18 @@ class StepByStepAttributor:
             partial = render_history(history[: i + 1])
             judge = self._judge_step(problem, partial, ground_truth if self.include_ground_truth else None)
             if judge["is_error"]:
-                agent = _agent_from_turn(turn)
-                k = i + 1
-                reason = f"First error detected at step {k} by '{agent}'. {judge['explanation']}".strip()
-                return {"agent_name": agent, "step_number": k, "reason": reason}
+                agent = _agent_from_turn(turn); k = i + 1
+                return {"agent_name": agent, "step_number": k, "reason": f"First error detected at step {k} by '{agent}'. {judge['explanation']}".strip()}
         agent = _agent_from_turn(history[-1])
         return {"agent_name": agent, "step_number": len(history), "reason": "No decisive error flagged by the judge at any step; defaulted to the final step/agent as a tie-breaker."}
-
     def _judge_step(self, problem: str, partial_log: str, ground_truth: Optional[str] = None) -> Dict[str, Any]:
-        sys = (
-            "You are an expert judge for multi-agent failure attribution. "
-            "Always return ONLY a JSON object with keys exactly: is_error, explanation. "
-            "Define 'error' as a decisive mistake that meaningfully derails solving the problem or makes the correct final answer unreachable."
-        )
+        sys = ("You are an expert judge for multi-agent failure attribution. "
+               "Always return ONLY a JSON object with keys exactly: is_error, explanation. "
+               "Define 'error' as a decisive mistake that meaningfully derails solving the problem or makes the correct final answer unreachable.")
         gt = f"\nThe Answer for the problem is: {ground_truth}" if ground_truth else ""
-        usr = (
-            f"The problem being addressed is: {problem}.{gt}\n"
-            f"Here is the conversation history up to the current step:\n{partial_log}\n\n"
-            'Your task: Determine whether the most recent agent’s action contains a decisive error that could hinder or prevent solving the problem. Respond ONLY as JSON:\n{"is_error": true or false, "explanation": "brief rationale"}'
-        )
+        usr = (f"The problem being addressed is: {problem}.{gt}\n"
+               f"Here is the conversation history up to the current step:\n{partial_log}\n\n"
+               'Your task: Determine whether the most recent agent’s action contains a decisive error that could hinder or prevent solving the problem. Respond ONLY as JSON:\n{"is_error": true or false, "explanation": "brief rationale"}')
         resp = self.client.chat.completions.create(model=self.model, messages=[{"role": "system", "content": sys}, {"role": "user", "content": usr}], temperature=self.temperature)
         raw = resp.choices[0].message.content
         try:
@@ -171,18 +184,10 @@ def step_by_step(category, convo_id, *, include_ground_truth=False):
 # Binary search judge to locate earliest decisive error in O(log n)
 class BinarySearchAttributor:
     def __init__(self, client: OpenAI, model: str = "gpt-4o-mini", temperature: float = 0.0, include_ground_truth: bool = False):
-        self.client = client
-        self.model = model
-        self.temperature = temperature
-        self.include_ground_truth = include_ground_truth
-
+        self.client = client; self.model = model; self.temperature = temperature; self.include_ground_truth = include_ground_truth
     def attribute_from_dataset(self, category, convo_id: int) -> Dict[str, Any]:
-        convo = category["train"][convo_id]
-        problem = convo["question"]
-        history = convo["history"]
-        gt = convo.get("answer") or convo.get("final_answer") or convo.get("label") or None
-        return self.attribute(problem=problem, history=history, ground_truth=gt)
-
+        c = category["train"][convo_id]; gt = c.get("answer") or c.get("final_answer") or c.get("label") or None
+        return self.attribute(problem=c["question"], history=c["history"], ground_truth=gt)
     def attribute(self, problem: str, history: List[Any], ground_truth: Optional[str] = None) -> Dict[str, Any]:
         if not isinstance(history, list) or not history:
             return {"agent_name": "Unknown", "step_number": 1, "reason": "Empty or invalid history; unable to run binary-search attribution."}
@@ -206,19 +211,14 @@ class BinarySearchAttributor:
         part_k = render_history(history[:k])
         reason = self._explain_step(problem, part_k, k, agent, ground_truth if self.include_ground_truth else None)
         return {"agent_name": agent, "step_number": k, "reason": reason}
-
     def _prefix_has_error(self, problem: str, partial_log: str, ground_truth: Optional[str] = None):
-        sys = (
-            "You are an expert judge for multi-agent failure attribution. "
-            "Return ONLY JSON with keys exactly: has_error, rationale. "
-            "A 'decisive error' is a mistake in the prefix that, even if all future messages were perfect, would still likely derail or make it impossible to reach the correct final answer without first correcting that mistake."
-        )
+        sys = ("You are an expert judge for multi-agent failure attribution. "
+               "Return ONLY JSON with keys exactly: has_error, rationale. "
+               "A 'decisive error' is a mistake in the prefix that, even if all future messages were perfect, would still likely derail or make it impossible to reach the correct final answer without first correcting that mistake.")
         gt = f"\nGround truth answer (if known): {ground_truth}" if ground_truth else ""
-        usr = (
-            f"Problem: {problem}.{gt}\n"
-            f"Conversation prefix (up to and including the current step):\n{partial_log}\n\n"
-            'Question: Does this prefix already contain a decisive, unrecoverable error as defined above?\nRespond ONLY as JSON:\n{"has_error": true|false, "rationale": "brief reason"}'
-        )
+        usr = (f"Problem: {problem}.{gt}\n"
+               f"Conversation prefix (up to and including the current step):\n{partial_log}\n\n"
+               'Question: Does this prefix already contain a decisive, unrecoverable error as defined above?\nRespond ONLY as JSON:\n{"has_error": true|false, "rationale": "brief reason"}')
         try:
             resp = self.client.chat.completions.create(model=self.model, messages=[{"role": "system", "content": sys}, {"role": "user", "content": usr}], temperature=self.temperature)
             raw = resp.choices[0].message.content
@@ -226,16 +226,13 @@ class BinarySearchAttributor:
             return _coerce_bool(parsed.get("has_error", False)), str(parsed.get("rationale", "")).strip()
         except Exception as e:
             return False, f"Judge parsing issue; treated as no-error. Detail: {e}"
-
     def _explain_step(self, problem: str, partial_log: str, step_index: int, agent_name: str, ground_truth: Optional[str] = None) -> str:
         sys = "You are an expert judge for multi-agent failure attribution. Return ONLY JSON with keys exactly: reason."
         gt = f"\nGround truth answer (if known): {ground_truth}" if ground_truth else ""
-        usr = (
-            f"Problem: {problem}.{gt}\n"
-            f"You have identified that the earliest decisive error occurs at step {step_index}, spoken by '{agent_name}'.\n"
-            f"Conversation up to and including step {step_index}:\n{partial_log}\n\n"
-            f'Briefly explain why the message at this step is a decisive error. Avoid vague wording; explicitly refer to "the message at step {step_index}". Respond ONLY as JSON:\n{{"reason": "concise explanation"}}'
-        )
+        usr = (f"Problem: {problem}.{gt}\n"
+               f"You have identified that the earliest decisive error occurs at step {step_index}, spoken by '{agent_name}'.\n"
+               f"Conversation up to and including step {step_index}:\n{partial_log}\n\n"
+               f'Briefly explain why the message at this step is a decisive error. Avoid vague wording; explicitly refer to "the message at step {step_index}". Respond ONLY as JSON:\n{{"reason": "concise explanation"}}')
         try:
             resp = self.client.chat.completions.create(model=self.model, messages=[{"role": "system", "content": sys}, {"role": "user", "content": usr}], temperature=self.temperature)
             raw = resp.choices[0].message.content
@@ -247,11 +244,63 @@ class BinarySearchAttributor:
         except Exception as e:
             return f"The message at step {step_index} by '{agent_name}' is the earliest decisive error, but the judge explanation could not be parsed. Detail: {e}"
 
+def step_by_step(category, convo_id, *, include_ground_truth=False):
+    a = StepByStepAttributor(client=client, model="gpt-4o-mini", temperature=0.0, include_ground_truth=include_ground_truth)
+    return a.attribute_from_dataset(category, convo_id)
+
 def binary_search(category, convo_id, *, include_ground_truth=False):
     a = BinarySearchAttributor(client=client, model="gpt-4o-mini", temperature=0.0, include_ground_truth=include_ground_truth)
     return a.attribute_from_dataset(category, convo_id)
 
+def _evaluate_dataset(ds, ds_name: str) -> pd.DataFrame:
+    methods = {
+        "all_at_once": lambda cat, i: all_at_once(cat, i),
+        "step_by_step": lambda cat, i: step_by_step(cat, i, include_ground_truth=False),
+        "binary_search": lambda cat, i: binary_search(cat, i, include_ground_truth=False),
+    }
+    rows = []
+    n = len(ds["train"])
+    for method, fn in methods.items():
+        counted = agent_ok = step_ok = joint_ok = 0
+        for i in tqdm(range(n), desc=f"{ds_name} | {method}", ascii=True, leave=True):
+            convo = ds["train"][i]
+            gold_agent, gold_step = _extract_gold(convo)
+            if gold_agent is None or gold_step is None:
+                continue
+            try:
+                pred = fn(ds, i)
+            except Exception:
+                continue
+            pa = _norm_name(pred.get("agent_name"))
+            ga = _norm_name(gold_agent)
+            try:
+                ps = int(pred.get("step_number"))
+            except Exception:
+                ps = None
+            a_hit = (pa is not None and ga is not None and pa == ga)
+            s_hit = (ps is not None and gold_step is not None and ps == int(gold_step))
+            counted += 1
+            agent_ok += int(a_hit)
+            step_ok += int(s_hit)
+            joint_ok += int(a_hit and s_hit)
+        rows.append({
+            "dataset": ds_name,
+            "method": method,
+            "n_eval": counted,
+            "agent_acc": (agent_ok / counted) if counted else 0.0,
+            "step_acc": (step_ok / counted) if counted else 0.0,
+            "joint_acc": (joint_ok / counted) if counted else 0.0,
+            "agent_correct": agent_ok,
+            "step_correct": step_ok,
+            "joint_correct": joint_ok,
+        })
+    return pd.DataFrame(rows)
+
 if __name__ == "__main__":
-    print(all_at_once(algo_ds, 0))
-    print(step_by_step(algo_ds, 0))
-    print(binary_search(algo_ds, 0))
+    df_algo = _evaluate_dataset(algo_ds, "Algorithm-Generated")
+    df_hand = _evaluate_dataset(hand_ds, "Hand-Crafted")
+    df = pd.concat([df_algo, df_hand], ignore_index=True)
+    df = df[["dataset", "method", "n_eval", "agent_acc", "step_acc", "joint_acc", "agent_correct", "step_correct", "joint_correct"]]
+    df[["agent_acc", "step_acc", "joint_acc"]] = df[["agent_acc", "step_acc", "joint_acc"]].round(4)
+    print("\n=== Evaluation Results ===")
+    print(df.to_string(index=False))
