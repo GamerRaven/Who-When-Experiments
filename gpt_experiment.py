@@ -5,93 +5,53 @@ import pandas as pd
 import json, re
 from typing import Any, Dict, List, Optional, Tuple
 
-client = OpenAI()
-algo_ds = load_dataset("Kevin355/Who_and_When", "Algorithm-Generated")
-hand_ds = load_dataset("Kevin355/Who_and_When", "Hand-Crafted")
+MODEL = "gpt-4o"
+DETERMINISM = dict(temperature=0, top_p=0)
 
-def render_history(history):
-    if isinstance(history, str):
-        return history
-    if isinstance(history, list):
-        return "\n".join(json.dumps(turn, ensure_ascii=False) for turn in history)
-    return str(history)
+client = OpenAI()
 
 def _extract_json(text: str) -> dict:
     if not isinstance(text, str):
         raise ValueError("Model output is not text.")
+    # exact JSON
     try:
         return json.loads(text)
     except Exception:
         pass
+    # fenced JSON
     m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL | re.IGNORECASE)
     if m:
         return json.loads(m.group(1))
+    # first {...} blob
     a, b = text.find("{"), text.rfind("}")
     if a != -1 and b != -1 and b > a:
         return json.loads(text[a:b+1])
     raise ValueError("No JSON object found in model output.")
-
-def _normalize_and_validate(d: dict) -> dict:
-    def norm(k): return k.strip().lower().replace(" ", "_")
-    nd = {norm(k): v for k, v in d.items()}
-    aliases = {
-        "agent": "agent_name", "name": "agent_name", "agentname": "agent_name",
-        "step": "step_number", "stepnum": "step_number", "stepnumber": "step_number",
-        "reason_for_mistake": "reason", "explanation": "reason",
-    }
-    for k, v in list(nd.items()):
-        t = aliases.get(k)
-        if t and t not in nd:
-            nd[t] = v
-    missing = [k for k in ("agent_name", "step_number", "reason") if k not in nd]
-    if missing:
-        raise KeyError(f"Missing required keys in model output: {missing}. Got keys: {list(nd.keys())}")
-    nd["agent_name"] = str(nd["agent_name"]).strip()
-    try:
-        nd["step_number"] = int(nd["step_number"])
-    except Exception:
-        m = re.search(r"\d+", str(nd["step_number"]))
-        if not m:
-            raise ValueError(f"step_number is not an integer: {nd['step_number']}")
-        nd["step_number"] = int(m.group(0))
-    nd["reason"] = str(nd["reason"]).strip()
-    return {"agent_name": nd["agent_name"], "step_number": nd["step_number"], "reason": nd["reason"]}
 
 def _coerce_bool(v: Any) -> bool:
     if isinstance(v, bool):
         return v
     return str(v).strip().lower() in {"true", "yes", "y", "1"}
 
-def _agent_from_turn(turn: Any) -> str:
-    if isinstance(turn, dict):
-        for k in ("agent", "name", "speaker", "role"):
-            if k in turn and isinstance(turn[k], str) and turn[k].strip():
-                return turn[k].strip()
-        if len(turn) == 1:
-            k = next(iter(turn.keys()))
-            if isinstance(k, str) and k.strip():
-                return k.strip()
-    return "Unknown"
-
 def _norm_name(s: Optional[str]) -> Optional[str]:
     if s is None:
         return None
-    # normalize both gold and pred the same way (case/space/underscore/punct)
     return re.sub(r"[\W_]+", "", s).casefold()
 
 def _extract_gold(convo: Dict[str, Any]) -> Tuple[Optional[str], Optional[int]]:
-    # primary keys per dataset card
     ga = convo.get("mistake_agent")
     gs = convo.get("mistake_step")
-    # fallbacks just in case
     if ga is None:
         for k in ("agent_name", "agent", "who_failed", "failure_agent", "label"):
-            if k in convo and isinstance(convo[k], str) and convo[k].strip():
-                ga = convo[k]; break
+            v = convo.get(k)
+            if isinstance(v, str) and v.strip():
+                ga = v
+                break
     if gs is None:
         for k in ("step_number", "step", "when", "failure_step"):
             if k in convo:
-                gs = convo[k]; break
+                gs = convo[k]
+                break
     if isinstance(gs, str):
         m = re.search(r"\d+", gs)
         gs = int(m.group(0)) if m else None
@@ -102,190 +62,264 @@ def _extract_gold(convo: Dict[str, Any]) -> Tuple[Optional[str], Optional[int]]:
             gs = None
     return ga, gs
 
-def call_openai(prompt, model="gpt-4o-mini"):
-    system_msg = (
-        "You are an expert judge for multi-agent failure attribution. "
-        "Always return ONLY a JSON object with keys exactly: agent_name, step_number, reason. "
-        "The step numbering is 1-based and each message in the conversation counts as one step in order."
-    )
-    user_prompt = prompt + (
-        "\n\nFORMAT INSTRUCTIONS:\n- Return ONLY JSON (no prose, no markdown) with keys: "
-        '{"agent_name": string, "step_number": integer, "reason": string}.'
-    )
+def _turn_agent_name(turn: Any) -> Optional[str]:
+    if not isinstance(turn, dict):
+        return None
+    for k in ("agent", "name", "speaker", "role"):
+        v = turn.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    if len(turn) == 1:
+        k = next(iter(turn.keys()))
+        if isinstance(k, str) and k.strip():
+            return k.strip()
+    return None
+
+def _turn_text(turn: Any) -> str:
+    if not isinstance(turn, dict):
+        return str(turn)
+    for k in ("content", "message", "text", "assistant_response", "tool_call", "tool_result"):
+        v = turn.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    # fallback: compact json
+    return json.dumps(turn, ensure_ascii=False)
+
+def filter_agent_messages(history: Any, known_agents: Optional[List[str]] = None) -> Tuple[List[str], List[str], List[int]]:
+    lines, agents, idx_map = [], [], []
+    known_norm = {_norm_name(a) for a in (known_agents or []) if a}
+
+    for i, turn in enumerate(history if isinstance(history, list) else []):
+        name = _turn_agent_name(turn)
+        if not name:
+            continue
+        # if a whitelist is provided, keep only those
+        if known_norm and _norm_name(name) not in known_norm:
+            continue
+        # best-effort heuristic: skip tool/system-like roles
+        if name.lower() in {"system", "tool", "observation"}:
+            continue
+        msg = _turn_text(turn)
+        lines.append(f"{name}: {msg}")
+        agents.append(name)
+        idx_map.append(i)
+    return lines, agents, idx_map
+
+def infer_known_agents(history: Any) -> List[str]:
+    names = []
+    seen = set()
+    if isinstance(history, list):
+        for turn in history:
+            n = _turn_agent_name(turn)
+            if n and _norm_name(n) not in seen:
+                seen.add(_norm_name(n))
+                names.append(n)
+    return names
+
+def ask_json(system: str, user: str) -> dict:
     resp = client.chat.completions.create(
-        model=model,
-        messages=[{"role": "system", "content": system_msg}, {"role": "user", "content": user_prompt}],
-        temperature=0,
+        model=MODEL,
+        messages=[{"role": "system", "content": system},
+                  {"role": "user", "content": user}],
+        **DETERMINISM
     )
-    raw = resp.choices[0].message.content
-    parsed = _extract_json(raw)
-    return _normalize_and_validate(parsed)
+    return _extract_json(resp.choices[0].message.content)
 
-def all_at_once(category, convo_id):
-    convo = category["train"][convo_id]
-    problem = convo["question"]
-    chat = render_history(convo["history"])
-    prompt = (
-        "You are an AI assistant tasked with analyzing a multi-agent conversation history when solving a real world problem. "
-        f"The problem is: {problem}\n"
-        "Identify which agent made an error, at which step, and explain the reason for the error. "
-        "Here's the conversation:\n\n" + chat +
-        "\n\nBased on this conversation, please predict the following:\n"
-        "1. The name of the agent who made a mistake that should be directly responsible for the wrong solution to the real world problem. "
-        "If there are no agents that make obvious mistakes, decide one single agent in your mind. Directly output the name of the Expert.\n"
-        "2. In which step the mistake agent first made mistake. For example, in a conversation structured as follows: "
-        '{\n    "agent a": "xx",\n    "agent b": "xxxx",\n    "agent c": "xxxxx",\n    "agent a": "xxxxxxx"\n}\n'
-        "each entry represents a 'step' where an agent provides input. The 'x' symbolizes the speech of each agent. "
-        "If the mistake is in agent c's speech, the step number is 2. If the second speech by 'agent a' contains the mistake, the step number is 3, and so on. "
-        "Please determine the step number where the first mistake occurred.\n"
-        "3. The reason for your prediction.\n"
-        "Please answer in the format: Agent Name: (Your prediction)\n Step Number: (Your prediction)\n Reason for Mistake: \n"
+def ask_upper_lower(system: str, user: str) -> str:
+    resp = client.chat.completions.create(
+        model=MODEL,
+        messages=[{"role": "system", "content": system},
+                  {"role": "user", "content": user}],
+        **DETERMINISM
     )
-    return call_openai(prompt)
+    txt = resp.choices[0].message.content.strip().lower()
+    # accept raw or json
+    try:
+        d = _extract_json(txt)
+        choice = str(d.get("choice", "")).lower()
+        if "upper" in choice:
+            return "upper"
+        if "lower" in choice:
+            return "lower"
+    except Exception:
+        pass
+    if "upper" in txt:
+        return "upper"
+    if "lower" in txt:
+        return "lower"
+    # fallback: force upper to keep search progressing deterministically
+    return "upper"
 
-# Step-wise judge that returns the earliest decisive error encountered
-class StepByStepAttributor:
-    def __init__(self, client: OpenAI, model: str = "gpt-4o-mini", temperature: float = 0.0, include_ground_truth: bool = False):
-        self.client = client; self.model = model; self.temperature = temperature; self.include_ground_truth = include_ground_truth
-    def attribute_from_dataset(self, category, convo_id: int) -> Dict[str, Any]:
-        c = category["train"][convo_id]; gt = c.get("answer") or c.get("final_answer") or c.get("label") or None
-        return self.attribute(problem=c["question"], history=c["history"], ground_truth=gt)
-    def attribute(self, problem: str, history: List[Any], ground_truth: Optional[str] = None) -> Dict[str, Any]:
-        if not isinstance(history, list) or not history:
-            return {"agent_name": "Unknown", "step_number": 1, "reason": "Empty or invalid history; unable to run step-by-step attribution."}
-        for i, turn in enumerate(history):
-            partial = render_history(history[: i + 1])
-            judge = self._judge_step(problem, partial, ground_truth if self.include_ground_truth else None)
-            if judge["is_error"]:
-                agent = _agent_from_turn(turn); k = i + 1
-                return {"agent_name": agent, "step_number": k, "reason": f"First error detected at step {k} by '{agent}'. {judge['explanation']}".strip()}
-        agent = _agent_from_turn(history[-1])
-        return {"agent_name": agent, "step_number": len(history), "reason": "No decisive error flagged by the judge at any step; defaulted to the final step/agent as a tie-breaker."}
-    def _judge_step(self, problem: str, partial_log: str, ground_truth: Optional[str] = None) -> Dict[str, Any]:
-        sys = ("You are an expert judge for multi-agent failure attribution. "
-               "Always return ONLY a JSON object with keys exactly: is_error, explanation. "
-               "Define 'error' as a decisive mistake that meaningfully derails solving the problem or makes the correct final answer unreachable.")
-        gt = f"\nThe Answer for the problem is: {ground_truth}" if ground_truth else ""
-        usr = (f"The problem being addressed is: {problem}.{gt}\n"
-               f"Here is the conversation history up to the current step:\n{partial_log}\n\n"
-               'Your task: Determine whether the most recent agent’s action contains a decisive error that could hinder or prevent solving the problem. Respond ONLY as JSON:\n{"is_error": true or false, "explanation": "brief rationale"}')
-        resp = self.client.chat.completions.create(model=self.model, messages=[{"role": "system", "content": sys}, {"role": "user", "content": usr}], temperature=self.temperature)
-        raw = resp.choices[0].message.content
+def all_at_once(problem: str,
+                agent_lines: List[str],
+                agent_names: List[str],
+                *,
+                ground_truth: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    convo = "\n".join(agent_lines)
+    gt = f'\nGround truth answer: {ground_truth}' if ground_truth else ''
+    sys = (
+        "You are an expert judge for multi-agent failure attribution. "
+        "Return ONLY JSON with keys exactly: agent_name, step_number, reason. "
+        "Step numbering is 1-based and counts ONLY agent messages."
+    )
+    usr = (
+        f"Problem: {problem}{gt}\n\n"
+        f"Conversation (agent-only, in order, one message per step):\n{convo}\n\n"
+        "Decide:\n"
+        "1) agent_name: the single agent most directly responsible for the failure\n"
+        "2) step_number: the earliest step where that agent makes a decisive error\n"
+        "3) reason: concise explanation tied to that step\n"
+        'Respond ONLY as JSON: {"agent_name": string, "step_number": integer, "reason": string}'
+    )
+    try:
+        out = ask_json(sys, usr)
+        # light validation
+        agent = str(out["agent_name"]).strip()
+        step = int(re.search(r"\d+", str(out["step_number"])).group(0))
+        reason = str(out.get("reason", "")).strip()
+        return {"agent_name": agent, "step_number": step, "reason": reason}
+    except Exception:
+        return None
+
+def step_by_step(problem: str,
+                 agent_lines: List[str],
+                 agent_names: List[str],
+                 *,
+                 ground_truth: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    gt = f'\nGround truth answer: {ground_truth}' if ground_truth else ''
+    judge_sys = (
+        "You are an expert judge for multi-agent failure attribution. "
+        "Return ONLY JSON with keys exactly: is_error, explanation. "
+        "A 'decisive error' is a mistake in the most recent message that derails or makes the correct final answer unreachable unless corrected first."
+    )
+    for k in range(1, len(agent_lines) + 1):
+        prefix = "\n".join(agent_lines[:k])
+        usr = (
+            f"Problem: {problem}{gt}\n\n"
+            f"Conversation prefix (steps 1..{k}):\n{prefix}\n\n"
+            'Does the latest message (step {k}) contain a decisive error as defined? '
+            'Respond ONLY as JSON: {"is_error": true|false, "explanation": "brief"}'
+        )
         try:
-            parsed = _extract_json(raw)
+            out = ask_json(judge_sys, usr)
+            if _coerce_bool(out.get("is_error", False)):
+                return {"agent_name": agent_names[k-1],
+                        "step_number": k,
+                        "reason": f"First decisive error at step {k} by {agent_names[k-1]}: {str(out.get('explanation','')).strip()}"}
         except Exception:
-            return {"is_error": False, "explanation": f"Judge returned non-parseable output; treating as no-error. Raw: {raw[:200]}"}
-        return {"is_error": _coerce_bool(parsed.get("is_error", False)), "explanation": str(parsed.get("explanation", "")).strip()}
+            # treat as no error and continue
+            continue
+    # no decisive error detected
+    return None
 
-def step_by_step(category, convo_id, *, include_ground_truth=False):
-    a = StepByStepAttributor(client=client, model="gpt-4o-mini", temperature=0.0, include_ground_truth=include_ground_truth)
-    return a.attribute_from_dataset(category, convo_id)
+# ------------------------ Methods: Binary Search -----------------------------
 
-# Binary search judge to locate earliest decisive error in O(log n)
-class BinarySearchAttributor:
-    def __init__(self, client: OpenAI, model: str = "gpt-4o-mini", temperature: float = 0.0, include_ground_truth: bool = False):
-        self.client = client; self.model = model; self.temperature = temperature; self.include_ground_truth = include_ground_truth
-    def attribute_from_dataset(self, category, convo_id: int) -> Dict[str, Any]:
-        c = category["train"][convo_id]; gt = c.get("answer") or c.get("final_answer") or c.get("label") or None
-        return self.attribute(problem=c["question"], history=c["history"], ground_truth=gt)
-    def attribute(self, problem: str, history: List[Any], ground_truth: Optional[str] = None) -> Dict[str, Any]:
-        if not isinstance(history, list) or not history:
-            return {"agent_name": "Unknown", "step_number": 1, "reason": "Empty or invalid history; unable to run binary-search attribution."}
-        n = len(history)
-        full = render_history(history[:n])
-        has_full, _ = self._prefix_has_error(problem, full, ground_truth if self.include_ground_truth else None)
-        if not has_full:
-            agent = _agent_from_turn(history[-1])
-            return {"agent_name": agent, "step_number": n, "reason": "No decisive error flagged by the judge in the full conversation; defaulted to the final step/agent as a tie-breaker."}
-        lo, hi = 1, n
-        while lo < hi:
-            mid = (lo + hi) // 2
-            prefix = render_history(history[:mid])
-            has_err, _ = self._prefix_has_error(problem, prefix, ground_truth if self.include_ground_truth else None)
-            if has_err:
-                hi = mid
-            else:
-                lo = mid + 1
-        k = lo
-        agent = _agent_from_turn(history[k - 1])
-        part_k = render_history(history[:k])
-        reason = self._explain_step(problem, part_k, k, agent, ground_truth if self.include_ground_truth else None)
-        return {"agent_name": agent, "step_number": k, "reason": reason}
-    def _prefix_has_error(self, problem: str, partial_log: str, ground_truth: Optional[str] = None):
-        sys = ("You are an expert judge for multi-agent failure attribution. "
-               "Return ONLY JSON with keys exactly: has_error, rationale. "
-               "A 'decisive error' is a mistake in the prefix that, even if all future messages were perfect, would still likely derail or make it impossible to reach the correct final answer without first correcting that mistake.")
-        gt = f"\nGround truth answer (if known): {ground_truth}" if ground_truth else ""
-        usr = (f"Problem: {problem}.{gt}\n"
-               f"Conversation prefix (up to and including the current step):\n{partial_log}\n\n"
-               'Question: Does this prefix already contain a decisive, unrecoverable error as defined above?\nRespond ONLY as JSON:\n{"has_error": true|false, "rationale": "brief reason"}')
-        try:
-            resp = self.client.chat.completions.create(model=self.model, messages=[{"role": "system", "content": sys}, {"role": "user", "content": usr}], temperature=self.temperature)
-            raw = resp.choices[0].message.content
-            parsed = _extract_json(raw)
-            return _coerce_bool(parsed.get("has_error", False)), str(parsed.get("rationale", "")).strip()
-        except Exception as e:
-            return False, f"Judge parsing issue; treated as no-error. Detail: {e}"
-    def _explain_step(self, problem: str, partial_log: str, step_index: int, agent_name: str, ground_truth: Optional[str] = None) -> str:
-        sys = "You are an expert judge for multi-agent failure attribution. Return ONLY JSON with keys exactly: reason."
-        gt = f"\nGround truth answer (if known): {ground_truth}" if ground_truth else ""
-        usr = (f"Problem: {problem}.{gt}\n"
-               f"You have identified that the earliest decisive error occurs at step {step_index}, spoken by '{agent_name}'.\n"
-               f"Conversation up to and including step {step_index}:\n{partial_log}\n\n"
-               f'Briefly explain why the message at this step is a decisive error. Avoid vague wording; explicitly refer to "the message at step {step_index}". Respond ONLY as JSON:\n{{"reason": "concise explanation"}}')
-        try:
-            resp = self.client.chat.completions.create(model=self.model, messages=[{"role": "system", "content": sys}, {"role": "user", "content": usr}], temperature=self.temperature)
-            raw = resp.choices[0].message.content
-            parsed = _extract_json(raw)
-            r = str(parsed.get("reason", "")).strip()
-            if not r:
-                r = f"The message at step {step_index} by '{agent_name}' constitutes the earliest decisive error."
-            return r.replace("last agent", f"message at step {step_index}")
-        except Exception as e:
-            return f"The message at step {step_index} by '{agent_name}' is the earliest decisive error, but the judge explanation could not be parsed. Detail: {e}"
+def binary_search(problem: str,
+                  agent_lines: List[str],
+                  agent_names: List[str],
+                  *,
+                  ground_truth: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    
+    n = len(agent_lines)
+    if n == 0:
+        return None
+    gt = f'\nGround truth answer: {ground_truth}' if ground_truth else ''
 
-def step_by_step(category, convo_id, *, include_ground_truth=False):
-    a = StepByStepAttributor(client=client, model="gpt-4o-mini", temperature=0.0, include_ground_truth=include_ground_truth)
-    return a.attribute_from_dataset(category, convo_id)
+    lo, hi = 1, n
+    choose_sys = (
+        "You are an expert judge for multi-agent failure attribution. "
+        "Return ONLY a single word or JSON with key 'choice' indicating 'upper' or 'lower'. "
+        "You must choose which half is MORE LIKELY to contain the earliest decisive error."
+    )
+    while lo < hi:
+        mid = (lo + hi) // 2
+        segment = "\n".join(agent_lines[lo-1:hi])
+        usr = (
+            f"Problem: {problem}{gt}\n\n"
+            f"Conversation segment (steps {lo}..{hi}):\n{segment}\n\n"
+            f"Choose which half more likely contains the EARLIEST decisive error:\n"
+            f"UPPER = steps {lo}..{mid} ; LOWER = steps {mid+1}..{hi}.\n"
+            "Answer 'upper' or 'lower' (or JSON {\"choice\":\"upper|lower\"})."
+        )
+        choice = ask_upper_lower(choose_sys, usr)
+        if choice == "upper":
+            hi = mid
+        else:
+            lo = mid + 1
 
-def binary_search(category, convo_id, *, include_ground_truth=False):
-    a = BinarySearchAttributor(client=client, model="gpt-4o-mini", temperature=0.0, include_ground_truth=include_ground_truth)
-    return a.attribute_from_dataset(category, convo_id)
+    k = lo
 
-def _evaluate_dataset(ds, ds_name: str) -> pd.DataFrame:
-    methods = {
-        "all_at_once": lambda cat, i: all_at_once(cat, i),
-        "step_by_step": lambda cat, i: step_by_step(cat, i, include_ground_truth=False),
-        "binary_search": lambda cat, i: binary_search(cat, i, include_ground_truth=False),
-    }
+    reason_sys = (
+        "You are an expert judge for multi-agent failure attribution. "
+        "Return ONLY JSON with key 'reason'."
+    )
+    reason_usr = (
+        f"Problem: {problem}{gt}\n\n"
+        f"The earliest decisive error is hypothesized at step {k} said by {agent_names[k-1]}.\n"
+        f"Step {k} content:\n{agent_lines[k-1]}\n\n"
+        'Briefly explain why this specific message is a decisive error. '
+        'Respond ONLY as JSON: {"reason": "concise explanation"}'
+    )
+    try:
+        r = ask_json(reason_sys, reason_usr).get("reason", "")
+        return {"agent_name": agent_names[k-1], "step_number": k, "reason": str(r).strip()}
+    except Exception:
+        return {"agent_name": agent_names[k-1], "step_number": k, "reason": ""}
+
+def _evaluate_dataset(ds, ds_name: str, *, include_ground_truth: bool) -> pd.DataFrame:
     rows = []
     n = len(ds["train"])
-    for method, fn in methods.items():
+
+    for method_name in ("all_at_once", "step_by_step", "binary_search"):
         counted = agent_ok = step_ok = joint_ok = 0
-        for i in tqdm(range(n), desc=f"{ds_name} | {method}", ascii=True, leave=True):
+        for i in tqdm(range(n), desc=f"{ds_name} | {method_name} | {'withGT' if include_ground_truth else 'noGT'}",
+                      ascii=True, leave=False):
             convo = ds["train"][i]
             gold_agent, gold_step = _extract_gold(convo)
             if gold_agent is None or gold_step is None:
                 continue
-            try:
-                pred = fn(ds, i)
-            except Exception:
+
+            problem = convo.get("question") or convo.get("query") or ""
+            history = convo.get("history") or []
+
+            known = infer_known_agents(history)
+            lines, agents, idx_map = filter_agent_messages(history, known_agents=known)
+            if not lines:
                 continue
+
+            gt = convo.get("answer") or convo.get("final_answer") or convo.get("label") or None
+            gt = gt if include_ground_truth else None
+
+            if method_name == "all_at_once":
+                pred = all_at_once(problem, lines, agents, ground_truth=gt)
+            elif method_name == "step_by_step":
+                pred = step_by_step(problem, lines, agents, ground_truth=gt)
+            else:
+                pred = binary_search(problem, lines, agents, ground_truth=gt)
+
+            # if step-by-step (or others) returned None (no decisive error), skip counting (matches paper rationale better)
+            if not pred:
+                continue
+
             pa = _norm_name(pred.get("agent_name"))
             ga = _norm_name(gold_agent)
             try:
                 ps = int(pred.get("step_number"))
             except Exception:
                 ps = None
+
             a_hit = (pa is not None and ga is not None and pa == ga)
             s_hit = (ps is not None and gold_step is not None and ps == int(gold_step))
+
             counted += 1
             agent_ok += int(a_hit)
             step_ok += int(s_hit)
             joint_ok += int(a_hit and s_hit)
+
         rows.append({
             "dataset": ds_name,
-            "method": method,
+            "setting": "with_GT" if include_ground_truth else "without_GT",
+            "method": method_name,
             "n_eval": counted,
             "agent_acc": (agent_ok / counted) if counted else 0.0,
             "step_acc": (step_ok / counted) if counted else 0.0,
@@ -296,11 +330,36 @@ def _evaluate_dataset(ds, ds_name: str) -> pd.DataFrame:
         })
     return pd.DataFrame(rows)
 
-if __name__ == "__main__":
-    df_algo = _evaluate_dataset(algo_ds, "Algorithm-Generated")
-    df_hand = _evaluate_dataset(hand_ds, "Hand-Crafted")
-    df = pd.concat([df_algo, df_hand], ignore_index=True)
-    df = df[["dataset", "method", "n_eval", "agent_acc", "step_acc", "joint_acc", "agent_correct", "step_correct", "joint_correct"]]
+def run_all():
+    algo_ds = load_dataset("Kevin355/Who_and_When", "Algorithm-Generated")
+    hand_ds = load_dataset("Kevin355/Who_and_When", "Hand-Crafted")
+
+    # evaluate both settings
+    dfs = []
+    for with_gt in (True, False):
+        dfs.append(_evaluate_dataset(algo_ds, "Algorithm-Generated", include_ground_truth=with_gt))
+        dfs.append(_evaluate_dataset(hand_ds, "Hand-Crafted", include_ground_truth=with_gt))
+
+    df = pd.concat(dfs, ignore_index=True)
+    df = df[["dataset", "setting", "method", "n_eval", "agent_acc", "step_acc", "joint_acc",
+             "agent_correct", "step_correct", "joint_correct"]]
     df[["agent_acc", "step_acc", "joint_acc"]] = df[["agent_acc", "step_acc", "joint_acc"]].round(4)
-    print("\n=== Evaluation Results ===")
+
+    print("\n=== Evaluation Results (with and without GT separately) ===")
     print(df.to_string(index=False))
+
+    avg = (df.groupby(["dataset", "method"], as_index=False)
+             .agg(n_eval=("n_eval", "sum"),
+                  agent_acc=("agent_acc", "mean"),
+                  step_acc=("step_acc", "mean"),
+                  joint_acc=("joint_acc", "mean"),
+                  agent_correct=("agent_correct", "sum"),
+                  step_correct=("step_correct", "sum"),
+                  joint_correct=("joint_correct", "sum")))
+    avg[["agent_acc", "step_acc", "joint_acc"]] = avg[["agent_acc", "step_acc", "joint_acc"]].round(4)
+
+    print("\n=== Averaged over settings ===")
+    print(avg.to_string(index=False))
+
+if __name__ == "__main__":
+    run_all()
