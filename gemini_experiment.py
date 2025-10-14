@@ -1,14 +1,76 @@
+import os
+import json
+import re
+import time
+from typing import Any, Dict, List, Optional, Tuple
+
+import pandas as pd
 from datasets import load_dataset
 from openai import OpenAI
 from tqdm import tqdm
-import pandas as pd
-import json, re
-from typing import Any, Dict, List, Optional, Tuple
 
-MODEL = "gpt-4o"
-DETERMINISM = dict(temperature=0, top_p=0)
+MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-pro")
+DETERMINISM = dict(temperature=0, top_p=0)  # keep runs deterministic-ish
+MAX_TOKENS = 1024                           # plenty for judging prompts
+RETRIES = 3                                 # gentle retry for transient/empty replies
+BACKOFF_SEC = 1.25
 
-client = OpenAI()
+client = OpenAI(
+    api_key=os.environ.get("GEMINI_API_KEY"),
+    base_url=os.environ.get("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/"),
+)
+
+def _extract_choice_text(resp) -> str:
+    try:
+        choice = resp.choices[0]
+    except Exception:
+        return ""
+
+    # Standard OpenAI-compatible path: choice.message.content
+    msg = getattr(choice, "message", None)
+    if isinstance(msg, dict):
+        txt = msg.get("content")
+        if isinstance(txt, str):
+            return txt
+    elif hasattr(msg, "content"):
+        txt = msg.content
+        if isinstance(txt, str):
+            return txt
+
+    # Some adapters expose text directly on the choice
+    txt = getattr(choice, "text", None)
+    if isinstance(txt, str):
+        return txt
+
+    # Fallback: sometimes tool_calls or refusal fields; nothing textual
+    return ""
+
+
+def _safe_chat(system: str, user: str) -> str:
+    last_err = None
+    for attempt in range(RETRIES):
+        try:
+            resp = client.chat.completions.create(
+                model=MODEL,
+                messages=[{"role": "system", "content": system},
+                          {"role": "user", "content": user}],
+                max_tokens=MAX_TOKENS,
+                **DETERMINISM,
+            )
+            txt = _extract_choice_text(resp)
+            if isinstance(txt, str) and txt.strip():
+                return txt
+            # If no text, maybe a refusal or tool-call; back off and retry
+            time.sleep(BACKOFF_SEC * (attempt + 1))
+        except Exception as e:
+            last_err = e
+            time.sleep(BACKOFF_SEC * (attempt + 1))
+    # Final fallback: return empty string, or raise to surface the failure.
+    if last_err:
+        # Return empty so callers can decide fallback path deterministically.
+        return ""
+    return ""
+
 
 def _extract_json(text: str) -> dict:
     if not isinstance(text, str):
@@ -28,15 +90,18 @@ def _extract_json(text: str) -> dict:
         return json.loads(text[a:b+1])
     raise ValueError("No JSON object found in model output.")
 
+
 def _coerce_bool(v: Any) -> bool:
     if isinstance(v, bool):
         return v
     return str(v).strip().lower() in {"true", "yes", "y", "1"}
 
+
 def _norm_name(s: Optional[str]) -> Optional[str]:
     if s is None:
         return None
     return re.sub(r"[\W_]+", "", s).casefold()
+
 
 def _extract_gold(convo: Dict[str, Any]) -> Tuple[Optional[str], Optional[int]]:
     ga = convo.get("mistake_agent")
@@ -62,6 +127,7 @@ def _extract_gold(convo: Dict[str, Any]) -> Tuple[Optional[str], Optional[int]]:
             gs = None
     return ga, gs
 
+
 def _turn_agent_name(turn: Any) -> Optional[str]:
     if not isinstance(turn, dict):
         return None
@@ -75,6 +141,7 @@ def _turn_agent_name(turn: Any) -> Optional[str]:
             return k.strip()
     return None
 
+
 def _turn_text(turn: Any) -> str:
     if not isinstance(turn, dict):
         return str(turn)
@@ -82,8 +149,9 @@ def _turn_text(turn: Any) -> str:
         v = turn.get(k)
         if isinstance(v, str) and v.strip():
             return v.strip()
-    # fallback: compact json
+    # fallback: compact JSON
     return json.dumps(turn, ensure_ascii=False)
+
 
 def filter_agent_messages(history: Any, known_agents: Optional[List[str]] = None) -> Tuple[List[str], List[str], List[int]]:
     lines, agents, idx_map = [], [], []
@@ -93,11 +161,11 @@ def filter_agent_messages(history: Any, known_agents: Optional[List[str]] = None
         name = _turn_agent_name(turn)
         if not name:
             continue
-        # if a whitelist is provided, keep only those
+        # whitelist if provided
         if known_norm and _norm_name(name) not in known_norm:
             continue
-        # best-effort heuristic: skip tool/system-like roles
-        if name.lower() in {"system", "tool", "observation"}:
+        # skip obviously non-agent roles
+        if isinstance(name, str) and name.lower() in {"system", "tool", "observation"}:
             continue
         msg = _turn_text(turn)
         lines.append(f"{name}: {msg}")
@@ -105,37 +173,37 @@ def filter_agent_messages(history: Any, known_agents: Optional[List[str]] = None
         idx_map.append(i)
     return lines, agents, idx_map
 
+
 def infer_known_agents(history: Any) -> List[str]:
     names = []
     seen = set()
     if isinstance(history, list):
         for turn in history:
             n = _turn_agent_name(turn)
-            if n and _norm_name(n) not in seen:
-                seen.add(_norm_name(n))
+            nn = _norm_name(n) if n else None
+            if nn and nn not in seen:
+                seen.add(nn)
                 names.append(n)
     return names
 
 def ask_json(system: str, user: str) -> dict:
-    resp = client.chat.completions.create(
-        model=MODEL,
-        messages=[{"role": "system", "content": system},
-                  {"role": "user", "content": user}],
-        **DETERMINISM
-    )
-    return _extract_json(resp.choices[0].message.content)
+    txt = _safe_chat(system, user)
+    if not txt.strip():
+        # Make the failure explicit for debugging
+        raise RuntimeError("No textual content in model response (possibly a refusal or tool call).")
+    return _extract_json(txt)
+
 
 def ask_upper_lower(system: str, user: str) -> str:
-    resp = client.chat.completions.create(
-        model=MODEL,
-        messages=[{"role": "system", "content": system},
-                  {"role": "user", "content": user}],
-        **DETERMINISM
-    )
-    txt = resp.choices[0].message.content.strip().lower()
-    # accept raw or json
+    txt = _safe_chat(system, user)
+    if not txt.strip():
+        return "upper"  # deterministic fallback
+
+    low = txt.strip().lower()
+
+    # accept raw or JSON {"choice": "..."}
     try:
-        d = _extract_json(txt)
+        d = _extract_json(low)
         choice = str(d.get("choice", "")).lower()
         if "upper" in choice:
             return "upper"
@@ -143,12 +211,13 @@ def ask_upper_lower(system: str, user: str) -> str:
             return "lower"
     except Exception:
         pass
-    if "upper" in txt:
+
+    if "upper" in low:
         return "upper"
-    if "lower" in txt:
+    if "lower" in low:
         return "lower"
-    # fallback: force upper to keep search progressing deterministically
-    return "upper"
+
+    return "upper"  # final fallback
 
 def all_at_once(problem: str,
                 agent_lines: List[str],
@@ -173,13 +242,13 @@ def all_at_once(problem: str,
     )
     try:
         out = ask_json(sys, usr)
-        # light validation
         agent = str(out["agent_name"]).strip()
         step = int(re.search(r"\d+", str(out["step_number"])).group(0))
         reason = str(out.get("reason", "")).strip()
         return {"agent_name": agent, "step_number": step, "reason": reason}
     except Exception:
         return None
+
 
 def step_by_step(problem: str,
                  agent_lines: List[str],
@@ -194,30 +263,31 @@ def step_by_step(problem: str,
     )
     for k in range(1, len(agent_lines) + 1):
         prefix = "\n".join(agent_lines[:k])
+
         usr = (
             f"Problem: {problem}{gt}\n\n"
             f"Conversation prefix (steps 1..{k}):\n{prefix}\n\n"
-            'Does the latest message (step {k}) contain a decisive error as defined? '
+            f'Does the latest message (step {k}) contain a decisive error as defined? '
             'Respond ONLY as JSON: {"is_error": true|false, "explanation": "brief"}'
         )
         try:
             out = ask_json(judge_sys, usr)
             if _coerce_bool(out.get("is_error", False)):
-                return {"agent_name": agent_names[k-1],
-                        "step_number": k,
-                        "reason": f"First decisive error at step {k} by {agent_names[k-1]}: {str(out.get('explanation','')).strip()}"}
+                return {
+                    "agent_name": agent_names[k - 1],
+                    "step_number": k,
+                    "reason": f"First decisive error at step {k} by {agent_names[k - 1]}: {str(out.get('explanation','')).strip()}",
+                }
         except Exception:
-            # treat as no error and continue
             continue
-    # no decisive error detected
     return None
+
 
 def binary_search(problem: str,
                   agent_lines: List[str],
                   agent_names: List[str],
                   *,
                   ground_truth: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    
     n = len(agent_lines)
     if n == 0:
         return None
@@ -231,12 +301,12 @@ def binary_search(problem: str,
     )
     while lo < hi:
         mid = (lo + hi) // 2
-        segment = "\n".join(agent_lines[lo-1:hi])
+        segment = "\n".join(agent_lines[lo - 1:hi])
         usr = (
             f"Problem: {problem}{gt}\n\n"
             f"Conversation segment (steps {lo}..{hi}):\n{segment}\n\n"
             f"Choose which half more likely contains the EARLIEST decisive error:\n"
-            f"UPPER = steps {lo}..{mid} ; LOWER = steps {mid+1}..{hi}.\n"
+            f"UPPER = steps {lo}..{mid} ; LOWER = steps {mid + 1}..{hi}.\n"
             "Answer 'upper' or 'lower' (or JSON {\"choice\":\"upper|lower\"})."
         )
         choice = ask_upper_lower(choose_sys, usr)
@@ -246,23 +316,22 @@ def binary_search(problem: str,
             lo = mid + 1
 
     k = lo
-
     reason_sys = (
         "You are an expert judge for multi-agent failure attribution. "
         "Return ONLY JSON with key 'reason'."
     )
     reason_usr = (
         f"Problem: {problem}{gt}\n\n"
-        f"The earliest decisive error is hypothesized at step {k} said by {agent_names[k-1]}.\n"
-        f"Step {k} content:\n{agent_lines[k-1]}\n\n"
+        f"The earliest decisive error is hypothesized at step {k} said by {agent_names[k - 1]}.\n"
+        f"Step {k} content:\n{agent_lines[k - 1]}\n\n"
         'Briefly explain why this specific message is a decisive error. '
         'Respond ONLY as JSON: {"reason": "concise explanation"}'
     )
     try:
         r = ask_json(reason_sys, reason_usr).get("reason", "")
-        return {"agent_name": agent_names[k-1], "step_number": k, "reason": str(r).strip()}
+        return {"agent_name": agent_names[k - 1], "step_number": k, "reason": str(r).strip()}
     except Exception:
-        return {"agent_name": agent_names[k-1], "step_number": k, "reason": ""}
+        return {"agent_name": agent_names[k - 1], "step_number": k, "reason": ""}
 
 def _evaluate_dataset(ds, ds_name: str, *, include_ground_truth: bool) -> pd.DataFrame:
     rows = []
@@ -295,7 +364,6 @@ def _evaluate_dataset(ds, ds_name: str, *, include_ground_truth: bool) -> pd.Dat
             else:
                 pred = binary_search(problem, lines, agents, ground_truth=gt)
 
-            # if step-by-step (or others) returned None (no decisive error), skip counting (matches paper rationale better)
             if not pred:
                 continue
 
@@ -328,19 +396,22 @@ def _evaluate_dataset(ds, ds_name: str, *, include_ground_truth: bool) -> pd.Dat
         })
     return pd.DataFrame(rows)
 
+
 def run_all():
     algo_ds = load_dataset("Kevin355/Who_and_When", "Algorithm-Generated")
     hand_ds = load_dataset("Kevin355/Who_and_When", "Hand-Crafted")
 
-    # evaluate both settings
     dfs = []
     for with_gt in (True, False):
         dfs.append(_evaluate_dataset(algo_ds, "Algorithm-Generated", include_ground_truth=with_gt))
         dfs.append(_evaluate_dataset(hand_ds, "Hand-Crafted", include_ground_truth=with_gt))
 
     df = pd.concat(dfs, ignore_index=True)
-    df = df[["dataset", "setting", "method", "n_eval", "agent_acc", "step_acc", "joint_acc",
-             "agent_correct", "step_correct", "joint_correct"]]
+    df = df[[
+        "dataset", "setting", "method", "n_eval",
+        "agent_acc", "step_acc", "joint_acc",
+        "agent_correct", "step_correct", "joint_correct"
+    ]]
     df[["agent_acc", "step_acc", "joint_acc"]] = df[["agent_acc", "step_acc", "joint_acc"]].round(4)
 
     print("\n=== Evaluation Results (with and without GT separately) ===")
@@ -359,5 +430,6 @@ def run_all():
     print("\n=== Averaged over settings ===")
     print(avg.to_string(index=False))
 
+
 if __name__ == "__main__":
-    run_all()
+    run_all()   

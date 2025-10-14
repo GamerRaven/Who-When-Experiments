@@ -1,28 +1,42 @@
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Evaluate three failure-attribution strategies (all_at_once, step_by_step, binary_search)
+on the Who_and_When datasets using Anthropic Claude Sonnet 4 instead of OpenAI models.
+
+Requirements:
+  pip install anthropic datasets pandas tqdm
+
+Environment:
+  export ANTHROPIC_API_KEY=your_key_here
+"""
+
 from datasets import load_dataset
-from openai import OpenAI
+from anthropic import Anthropic
 from tqdm import tqdm
 import pandas as pd
 import json, re
 from typing import Any, Dict, List, Optional, Tuple
 
-MODEL = "gpt-4o"
+# === Model and decoding params ===
+MODEL = "claude-sonnet-4-20250514"  # Claude Sonnet 4 (docs list alias 'claude-sonnet-4')
 DETERMINISM = dict(temperature=0, top_p=0)
+MAX_TOKENS = 1024  # per call; adjust if you see truncation
 
-client = OpenAI()
+client = Anthropic()  # reads ANTHROPIC_API_KEY from env
 
+# === Helpers copied/adapted from original ===
 def _extract_json(text: str) -> dict:
     if not isinstance(text, str):
         raise ValueError("Model output is not text.")
-    # exact JSON
     try:
         return json.loads(text)
     except Exception:
         pass
-    # fenced JSON
     m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL | re.IGNORECASE)
     if m:
         return json.loads(m.group(1))
-    # first {...} blob
     a, b = text.find("{"), text.rfind("}")
     if a != -1 and b != -1 and b > a:
         return json.loads(text[a:b+1])
@@ -82,21 +96,17 @@ def _turn_text(turn: Any) -> str:
         v = turn.get(k)
         if isinstance(v, str) and v.strip():
             return v.strip()
-    # fallback: compact json
     return json.dumps(turn, ensure_ascii=False)
 
 def filter_agent_messages(history: Any, known_agents: Optional[List[str]] = None) -> Tuple[List[str], List[str], List[int]]:
     lines, agents, idx_map = [], [], []
     known_norm = {_norm_name(a) for a in (known_agents or []) if a}
-
     for i, turn in enumerate(history if isinstance(history, list) else []):
         name = _turn_agent_name(turn)
         if not name:
             continue
-        # if a whitelist is provided, keep only those
         if known_norm and _norm_name(name) not in known_norm:
             continue
-        # best-effort heuristic: skip tool/system-like roles
         if name.lower() in {"system", "tool", "observation"}:
             continue
         msg = _turn_text(turn)
@@ -106,8 +116,7 @@ def filter_agent_messages(history: Any, known_agents: Optional[List[str]] = None
     return lines, agents, idx_map
 
 def infer_known_agents(history: Any) -> List[str]:
-    names = []
-    seen = set()
+    names, seen = [], set()
     if isinstance(history, list):
         for turn in history:
             n = _turn_agent_name(turn)
@@ -116,23 +125,30 @@ def infer_known_agents(history: Any) -> List[str]:
                 names.append(n)
     return names
 
-def ask_json(system: str, user: str) -> dict:
-    resp = client.chat.completions.create(
+# === Anthropic call wrappers ===
+def _anthropic_call(system: str, user: str) -> str:
+    """Single text response from Claude."""
+    msg = client.messages.create(
         model=MODEL,
-        messages=[{"role": "system", "content": system},
-                  {"role": "user", "content": user}],
-        **DETERMINISM
+        max_tokens=MAX_TOKENS,
+        temperature=DETERMINISM.get("temperature", 0),
+        top_p=DETERMINISM.get("top_p", 1),
+        system=system,
+        messages=[{"role": "user", "content": user}],
     )
-    return _extract_json(resp.choices[0].message.content)
+    # Message content is a list of content blocks; we expect first to be text
+    parts = getattr(msg, "content", [])
+    if parts and getattr(parts[0], "type", "") == "text" and getattr(parts[0], "text", None):
+        return parts[0].text
+    # Fallback to stringifying whole object
+    return str(msg)
+
+def ask_json(system: str, user: str) -> dict:
+    txt = _anthropic_call(system, user)
+    return _extract_json(txt)
 
 def ask_upper_lower(system: str, user: str) -> str:
-    resp = client.chat.completions.create(
-        model=MODEL,
-        messages=[{"role": "system", "content": system},
-                  {"role": "user", "content": user}],
-        **DETERMINISM
-    )
-    txt = resp.choices[0].message.content.strip().lower()
+    txt = _anthropic_call(system, user).strip().lower()
     # accept raw or json
     try:
         d = _extract_json(txt)
@@ -147,9 +163,9 @@ def ask_upper_lower(system: str, user: str) -> str:
         return "upper"
     if "lower" in txt:
         return "lower"
-    # fallback: force upper to keep search progressing deterministically
-    return "upper"
+    return "upper"  # deterministic fallback
 
+# === Strategies (unchanged logic, new back-end) ===
 def all_at_once(problem: str,
                 agent_lines: List[str],
                 agent_names: List[str],
@@ -173,7 +189,6 @@ def all_at_once(problem: str,
     )
     try:
         out = ask_json(sys, usr)
-        # light validation
         agent = str(out["agent_name"]).strip()
         step = int(re.search(r"\d+", str(out["step_number"])).group(0))
         reason = str(out.get("reason", "")).strip()
@@ -197,19 +212,19 @@ def step_by_step(problem: str,
         usr = (
             f"Problem: {problem}{gt}\n\n"
             f"Conversation prefix (steps 1..{k}):\n{prefix}\n\n"
-            'Does the latest message (step {k}) contain a decisive error as defined? '
+            f"Does the latest message (step {k}) contain a decisive error as defined? "
             'Respond ONLY as JSON: {"is_error": true|false, "explanation": "brief"}'
         )
         try:
             out = ask_json(judge_sys, usr)
             if _coerce_bool(out.get("is_error", False)):
-                return {"agent_name": agent_names[k-1],
-                        "step_number": k,
-                        "reason": f"First decisive error at step {k} by {agent_names[k-1]}: {str(out.get('explanation','')).strip()}"}
+                return {
+                    "agent_name": agent_names[k-1],
+                    "step_number": k,
+                    "reason": f"First decisive error at step {k} by {agent_names[k-1]}: {str(out.get('explanation','')).strip()}"
+                }
         except Exception:
-            # treat as no error and continue
             continue
-    # no decisive error detected
     return None
 
 def binary_search(problem: str,
@@ -217,7 +232,6 @@ def binary_search(problem: str,
                   agent_names: List[str],
                   *,
                   ground_truth: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    
     n = len(agent_lines)
     if n == 0:
         return None
@@ -267,7 +281,6 @@ def binary_search(problem: str,
 def _evaluate_dataset(ds, ds_name: str, *, include_ground_truth: bool) -> pd.DataFrame:
     rows = []
     n = len(ds["train"])
-
     for method_name in ("all_at_once", "step_by_step", "binary_search"):
         counted = agent_ok = step_ok = joint_ok = 0
         for i in tqdm(range(n), desc=f"{ds_name} | {method_name} | {'withGT' if include_ground_truth else 'noGT'}",
@@ -276,44 +289,34 @@ def _evaluate_dataset(ds, ds_name: str, *, include_ground_truth: bool) -> pd.Dat
             gold_agent, gold_step = _extract_gold(convo)
             if gold_agent is None or gold_step is None:
                 continue
-
             problem = convo.get("question") or convo.get("query") or ""
             history = convo.get("history") or []
-
             known = infer_known_agents(history)
             lines, agents, idx_map = filter_agent_messages(history, known_agents=known)
             if not lines:
                 continue
-
             gt = convo.get("answer") or convo.get("final_answer") or convo.get("label") or None
             gt = gt if include_ground_truth else None
-
             if method_name == "all_at_once":
                 pred = all_at_once(problem, lines, agents, ground_truth=gt)
             elif method_name == "step_by_step":
                 pred = step_by_step(problem, lines, agents, ground_truth=gt)
             else:
                 pred = binary_search(problem, lines, agents, ground_truth=gt)
-
-            # if step-by-step (or others) returned None (no decisive error), skip counting (matches paper rationale better)
             if not pred:
                 continue
-
             pa = _norm_name(pred.get("agent_name"))
             ga = _norm_name(gold_agent)
             try:
                 ps = int(pred.get("step_number"))
             except Exception:
                 ps = None
-
             a_hit = (pa is not None and ga is not None and pa == ga)
             s_hit = (ps is not None and gold_step is not None and ps == int(gold_step))
-
             counted += 1
             agent_ok += int(a_hit)
             step_ok += int(s_hit)
             joint_ok += int(a_hit and s_hit)
-
         rows.append({
             "dataset": ds_name,
             "setting": "with_GT" if include_ground_truth else "without_GT",
@@ -331,21 +334,16 @@ def _evaluate_dataset(ds, ds_name: str, *, include_ground_truth: bool) -> pd.Dat
 def run_all():
     algo_ds = load_dataset("Kevin355/Who_and_When", "Algorithm-Generated")
     hand_ds = load_dataset("Kevin355/Who_and_When", "Hand-Crafted")
-
-    # evaluate both settings
     dfs = []
     for with_gt in (True, False):
         dfs.append(_evaluate_dataset(algo_ds, "Algorithm-Generated", include_ground_truth=with_gt))
         dfs.append(_evaluate_dataset(hand_ds, "Hand-Crafted", include_ground_truth=with_gt))
-
     df = pd.concat(dfs, ignore_index=True)
     df = df[["dataset", "setting", "method", "n_eval", "agent_acc", "step_acc", "joint_acc",
              "agent_correct", "step_correct", "joint_correct"]]
     df[["agent_acc", "step_acc", "joint_acc"]] = df[["agent_acc", "step_acc", "joint_acc"]].round(4)
-
     print("\n=== Evaluation Results (with and without GT separately) ===")
     print(df.to_string(index=False))
-
     avg = (df.groupby(["dataset", "method"], as_index=False)
              .agg(n_eval=("n_eval", "sum"),
                   agent_acc=("agent_acc", "mean"),
@@ -355,7 +353,6 @@ def run_all():
                   step_correct=("step_correct", "sum"),
                   joint_correct=("joint_correct", "sum")))
     avg[["agent_acc", "step_acc", "joint_acc"]] = avg[["agent_acc", "step_acc", "joint_acc"]].round(4)
-
     print("\n=== Averaged over settings ===")
     print(avg.to_string(index=False))
 
